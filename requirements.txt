@@ -1,0 +1,11 @@
+# Python 3.11 or newer. No provider SDK or model weights are needed for RSL.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+httpx>=0.27,<1
+pydantic>=2.9,<3
+python-dotenv>=1.0,<2
+PyYAML>=6.0,<7
+aiosqlite>=0.20,<1
+
+# Optional semantic routing only: pip install sentence-transformers
+# This can download model weights; it is not needed for default routing or RSL.

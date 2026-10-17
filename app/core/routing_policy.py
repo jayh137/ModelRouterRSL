@@ -1,6 +1,7 @@
 import json
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 DEFAULT_MODEL_ALIASES = {"default", "auto", "profile-default"}
@@ -36,9 +37,20 @@ class RoutingPolicy(BaseModel):
     recommendation_weights: dict[str, float] | None = None
     recommendation_confidence_threshold: float | None = None
     recommendation_apply_to_explicit: bool = False
+    rsl_enabled: bool = False
+    rsl_mode: Literal["collect", "active"] = "collect"
     recommendation_excluded_models: list[str] = Field(
         default_factory=lambda: ["codex-auto-review", "codex-review"]
     )
+
+    @model_validator(mode="after")
+    def validate_rsl(self):
+        if self.rsl_enabled and (
+            "recommendation_enabled" not in self.model_fields_set
+            or not self.recommendation_enabled
+        ):
+            raise ValueError("RSL requires explicit recommendation_enabled=true")
+        return self
 
     @property
     def cost_bias_value(self) -> float:

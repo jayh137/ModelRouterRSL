@@ -1,0 +1,3 @@
+# Empty initial history. Never seed generated or invented quality scores here.
+# RSL versions are stored separately in ROUTER_RSL_DB and activated explicitly.
+profiles: {}

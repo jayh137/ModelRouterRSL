@@ -4,6 +4,7 @@ from app.core.route_preview import build_route_preview, parse_allowed_models
 from app.core.routing_policy import load_routing_policy
 from app.core.routing_settings import load_effective_routing_settings
 from app.schemas.admin import RoutePreviewRequest
+from app.rsl.runtime import prepare_runtime
 from ._auth import require_admin
 
 router = APIRouter(tags=["admin / inspect"])
@@ -42,7 +43,12 @@ async def preview_route(body: RoutePreviewRequest, request: Request, _=Depends(r
         available_models=set(request.app.state.router.model_map.keys()),
     )
 
-    return await build_route_preview(
+    recommender, trace = await prepare_runtime(
+        getattr(request.app.state, "rsl_store", None),
+        getattr(request.app.state, "recommender", None),
+        routing_policy, routing_profile_id, body.messages,
+    )
+    result = await build_route_preview(
         body,
         request.app.state.router,
         request.app.state.cascade,
@@ -52,7 +58,13 @@ async def preview_route(body: RoutePreviewRequest, request: Request, _=Depends(r
         semantic_routing_enabled=routing_settings["semantic_routing_enabled"],
         embedder=getattr(request.app.state, "embedder", None),
         recommendation_enabled=routing_policy.recommendation_enabled,
-        recommender=getattr(request.app.state, "recommender", None),
+        recommender=recommender,
         cascade_enabled=routing_settings["cascade_enabled"],
         allowed_models=allowed_models,
     )
+    result["rsl"] = {
+        "enabled": routing_policy.rsl_enabled,
+        "mode": routing_policy.rsl_mode,
+        "policy_version": trace.version_id if trace else None,
+    }
+    return result

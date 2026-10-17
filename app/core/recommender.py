@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from copy import copy, deepcopy
 import re
 from typing import Any
 
@@ -82,6 +83,7 @@ class RecommendationResult:
     excluded: list[dict[str, Any]]
     objective: dict[str, float]
     selection_policy: dict[str, Any] = field(default_factory=dict)
+    eligible_models: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,8 +145,6 @@ class ModelRecommender:
         runtime_metadata = runtime_data.get("metadata", {}) or {}
         self.runtime_signals = runtime_data.get("models", {}) or {}
         self.performance_history = performance_data if isinstance(performance_data, dict) else {}
-        performance_metadata = (self.performance_history.get("metadata") or {}) if self.performance_history else {}
-        performance_adjustment = performance_metadata.get("performance_adjustment") or {}
         self.excluded_models = set(DEFAULT_EXCLUDED_MODELS)
         self.excluded_models.update(metadata.get("hard_excluded_models") or [])
         self.tier_adjustments = {
@@ -180,6 +180,20 @@ class ModelRecommender:
                 metadata.get("success_rate_hard_penalty", 0.08),
             )
         )
+        self._load_performance_settings()
+        self.task_profiles = task_data.get("tasks", {}) or {}
+        self.objectives = task_data.get("objectives", {}) or {}
+
+    def with_performance_history(self, history: dict[str, Any]) -> "ModelRecommender":
+        """A request-local snapshot; activation must never mutate the shared router."""
+        snapshot = copy(self)
+        snapshot.performance_history = deepcopy(history)
+        snapshot._load_performance_settings()
+        return snapshot
+
+    def _load_performance_settings(self):
+        performance_metadata = self.performance_history.get("metadata") or {}
+        performance_adjustment = performance_metadata.get("performance_adjustment") or {}
         self.performance_history_enabled = bool(
             performance_adjustment.get("enabled", performance_metadata.get("enabled", True))
         )
@@ -204,8 +218,6 @@ class ModelRecommender:
                 performance_metadata.get("bad_output_penalty", 0.05),
             )
         )
-        self.task_profiles = task_data.get("tasks", {}) or {}
-        self.objectives = task_data.get("objectives", {}) or {}
 
     def _read_yaml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
@@ -843,4 +855,5 @@ class ModelRecommender:
             excluded=excluded[:20],
             objective=objective,
             selection_policy=selection_policy,
+            eligible_models=[item["model"] for item in candidates],
         )

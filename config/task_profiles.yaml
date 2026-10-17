@@ -1,0 +1,11 @@
+# Optional task classification rules. Without rules, requests use "general".
+# Example structure (uncomment after adapting to your workload):
+# tasks:
+#   coding:
+#     keywords: ["写代码", "单元测试", "debug"]
+#     weights: {reasoning: 0.5, instruction_following: 0.5}
+#   general:
+#     default: true
+#     weights: {reasoning: 0.35, instruction_following: 0.35, writing: 0.30}
+tasks: {}
+objectives: {}

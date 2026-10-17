@@ -1,0 +1,26 @@
+# TEMPLATE ONLY: never loaded automatically.
+# Replace both model identifiers with a real model available to your account.
+# Keep credentials in environment variables or an untracked .env file.
+providers:
+  openai:
+    base_url: ${OPENAI_BASE_URL}
+    timeout: 60
+    max_retries: 2
+    key_strategy: round_robin
+    keys:
+      - key: ${OPENAI_KEY_1}
+        rpm: 60
+    models:
+      - name: REPLACE_WITH_REAL_MODEL_ID
+        routing_keys:
+          - REPLACE_WITH_REAL_ROUTING_KEY
+        # Optional pricing.prompt / pricing.completion: currency per 1M tokens.
+        # Supply verified values for your provider; no zero-cost estimates here.
+server:
+  host: 127.0.0.1
+  port: 8000
+auth:
+  api_key: ${ROUTER_API_KEY}
+semantic_routing:
+  enabled: false
+keyword_rules: []

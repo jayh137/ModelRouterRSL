@@ -3,8 +3,9 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
+from contextlib import aclosing
 
-from fastapi import APIRouter, Request, BackgroundTasks
+from fastapi import APIRouter, Request, BackgroundTasks, Response
 from fastapi.responses import StreamingResponse
 
 from app.core.auth import resolve_request_context
@@ -27,6 +28,7 @@ from app.schemas.chat import (
     RoutingRetryMetadata,
 )
 from app.core.logging import log_request
+from app.rsl.runtime import prepare_runtime
 
 router = APIRouter()
 
@@ -84,6 +86,7 @@ async def chat_completions(
     body: ChatRequest,
     request: Request,
     background_tasks: BackgroundTasks,
+    response: Response = None,
 ):
     request_context = await resolve_request_context(request)
     db = request.app.state.db
@@ -107,6 +110,20 @@ async def chat_completions(
         available_models=available_models,
     )
     recommendation_applied = False
+    recommendation = None
+    recommender = getattr(request.app.state, "recommender", None)
+    rsl_trace = None
+    if not ensemble_requested:
+        recommender, rsl_trace = await prepare_runtime(
+            getattr(request.app.state, "rsl_store", None), recommender, routing_policy,
+            request_context.routing_profile_id, body.messages, request_context.request_id,
+        )
+
+    async def start_rsl(model, candidates):
+        if rsl_trace is not None:
+            await rsl_trace.start(model, candidates)
+            if response is not None:
+                response.headers.update(rsl_trace.headers)
 
     if not ensemble_requested:
         requested_is_auto = original_model in DEFAULT_MODEL_ALIASES
@@ -120,7 +137,6 @@ async def chat_completions(
                 quality_bias=routing_policy.quality_bias_value,
             )
 
-        recommender = getattr(request.app.state, "recommender", None)
         recommendation_requested = requested_is_auto or routing_policy.recommendation_apply_to_explicit
         if routing_policy.recommendation_enabled and recommendation_requested and recommender:
             recommendation = recommender.recommend(
@@ -262,6 +278,10 @@ async def chat_completions(
                 cascade_config,
                 routing_profile_id=request_context.routing_profile_id,
             )
+            if local_judge and allowed_models is not None and local_judge.judge_model not in allowed_models:
+                raise ModelAccessError(local_judge.judge_model)
+            if local_judge:
+                local_judge.rsl_trace = rsl_trace
             webhook_validator = cascade_engine.get_webhook_validator(
                 body.model,
                 routing_profile_id=request_context.routing_profile_id,
@@ -271,20 +291,24 @@ async def chat_completions(
                 cascade_config,
                 routing_profile_id=request_context.routing_profile_id,
             )
+            await start_rsl(chain[0][0], [entry[0] for entry in chain])
 
             if body.stream:
                 return StreamingResponse(
                     _stream_cascade(
                         body, chain, validator, local_judge, webhook_validator, max_escalations,
                         db, cascade_engine, request_context, elapsed, original_model, intent_category,
+                        rsl_trace=rsl_trace,
                     ),
                     media_type="text/event-stream",
+                    headers=rsl_trace.headers if rsl_trace else None,
                 )
 
             try:
                 resp, cascade_meta = await cascade_engine.execute_cascade(
                     body, original_model, chain, validator, local_judge, webhook_validator,
                     max_escalations, request_context.api_key_id,
+                    rsl_trace=rsl_trace,
                 )
                 ms = elapsed()
                 final_model_config = next(
@@ -300,10 +324,11 @@ async def chat_completions(
 
                 background_tasks.add_task(
                     cascade_engine.log_cascade,
-                    original_model, cascade_meta, 0.0, ms, request_context,
+                    original_model, cascade_meta, rsl_trace.total_cost if rsl_trace else 0.0, ms, request_context,
                 )
 
                 if resp:
+                    resp.actual_model = cascade_meta.final_model
                     resp.model = original_model
                     if intent_category:
                         resp.intent_category = intent_category
@@ -318,6 +343,8 @@ async def chat_completions(
                 )
                 raise
 
+    await start_rsl(body.model, recommendation.eligible_models if recommendation else [body.model])
+
     if body.stream:
         provider, model_config = await router_engine.route(body.model)
         return StreamingResponse(
@@ -331,8 +358,10 @@ async def chat_completions(
                 original_model,
                 intent_category,
                 router_engine,
+                rsl_trace=rsl_trace,
             ),
             media_type="text/event-stream",
+            headers=rsl_trace.headers if rsl_trace else None,
         )
 
     retry_history: list[str] = []
@@ -349,7 +378,10 @@ async def chat_completions(
         provider_label = getattr(provider, "provider_name", provider.__class__.__name__)
         attempted_model = body.model
         try:
-            resp = await provider.chat_completions(body, model_config)
+            if rsl_trace is not None:
+                resp = await rsl_trace.complete(provider, body, model_config, attempted_model)
+            else:
+                resp = await provider.chat_completions(body, model_config)
             ms = elapsed()
             usage = resp.usage
             if body.model != original_model:
@@ -420,20 +452,24 @@ async def _stream(
     original_model=None,
     intent_category=None,
     router_engine=None,
+    rsl_trace=None,
 ):
     usage: Usage | None = None
     error = None
 
     try:
-        async for chunk in provider.chat_completions_stream(body, model_config):
-            if chunk.usage:
-                usage = chunk.usage
-            if body.model != original_model and original_model is not None:
-                chunk.actual_model = body.model
-                chunk.model = original_model
-            if intent_category:
-                chunk.intent_category = intent_category
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        chunks = (rsl_trace.stream(provider, body, model_config, body.model) if rsl_trace
+                  else provider.chat_completions_stream(body, model_config))
+        async with aclosing(chunks):
+            async for chunk in chunks:
+                if chunk.usage:
+                    usage = chunk.usage
+                if body.model != original_model and original_model is not None:
+                    chunk.actual_model = body.model
+                    chunk.model = original_model
+                if intent_category:
+                    chunk.intent_category = intent_category
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
         yield "data: [DONE]\n\n"
     except ProviderError as e:
         if router_engine is not None:
@@ -449,6 +485,9 @@ async def _stream(
         error = str(e)
         yield f"data: {{\"error\":\"{error}\"}}\n\n"
         yield "data: [DONE]\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        error = "cancelled"
+        raise
     finally:
         ms = elapsed()
         await _write_log(
@@ -461,6 +500,7 @@ async def _stream(
 async def _stream_cascade(
     body, chain, validator, local_judge, webhook_validator, max_escalations,
     db, cascade_engine, request_context, elapsed, original_model, intent_category,
+    rsl_trace=None,
 ):
     models_attempted = []
     validation_reasons = []
@@ -483,13 +523,17 @@ async def _stream_cascade(
         error = None
 
         try:
-            async for chunk in provider.chat_completions_stream(body, model_config):
-                buffered_chunks.append(chunk)
-                if chunk.usage:
-                    usage = chunk.usage
-                    last_usage = chunk.usage
+            chunks = (rsl_trace.stream(provider, body, model_config, routing_key) if rsl_trace
+                      else provider.chat_completions_stream(body, model_config))
+            async with aclosing(chunks):
+                async for chunk in chunks:
+                    buffered_chunks.append(chunk)
+                    if chunk.usage:
+                        usage = chunk.usage
+                        last_usage = chunk.usage
         except Exception as e:
             error = str(e)
+            buffered_chunks = []
             validation_reasons.append(f"{routing_key}:provider_error:{str(e)[:50]}")
             continue
 
@@ -530,6 +574,8 @@ async def _stream_cascade(
             webhook_validator,
         )
         last_judge_result = judge_result
+        if rsl_trace:
+            await rsl_trace.feedback(rsl_trace.last_generation_attempt_id, is_valid, reason, judge_result)
 
         validation_reasons.append(f"{routing_key}:{reason}")
 
@@ -548,8 +594,8 @@ async def _stream_cascade(
             )
 
             for chunk in buffered_chunks:
-                if body.model != original_model and original_model is not None:
-                    chunk.actual_model = body.model
+                if routing_key != original_model and original_model is not None:
+                    chunk.actual_model = routing_key
                     chunk.model = original_model
                 if intent_category:
                     chunk.intent_category = intent_category
@@ -564,7 +610,7 @@ async def _stream_cascade(
                     last_model_config, request_context, ms, usage,
                 )
             await cascade_engine.log_cascade(
-                original_model, cascade_meta, 0.0, ms, request_context,
+                original_model, cascade_meta, rsl_trace.total_cost if rsl_trace else 0.0, ms, request_context,
             )
             return
 
@@ -589,8 +635,8 @@ async def _stream_cascade(
             judge_reason=last_judge_result.reason if last_judge_result else None,
         )
         for chunk in buffered_chunks:
-            if body.model != original_model and original_model is not None:
-                chunk.actual_model = body.model
+            if routing_key != original_model and original_model is not None:
+                chunk.actual_model = routing_key
                 chunk.model = original_model
             if intent_category:
                 chunk.intent_category = intent_category
@@ -621,5 +667,5 @@ async def _stream_cascade(
         judge_reason=last_judge_result.reason if last_judge_result else None,
     )
     await cascade_engine.log_cascade(
-        original_model, cascade_meta, 0.0, ms, request_context, status="error",
+        original_model, cascade_meta, rsl_trace.total_cost if rsl_trace else 0.0, ms, request_context, status="error",
     )

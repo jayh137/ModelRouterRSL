@@ -178,6 +178,7 @@ class CascadeEngine:
         webhook_validator: WebhookValidator | None,
         max_escalations: int,
         api_key_id: int = 0,
+        rsl_trace=None,
     ) -> tuple[ChatResponse, CascadeMetadata]:
         models_attempted = []
         validation_reasons = []
@@ -185,6 +186,7 @@ class CascadeEngine:
         last_provider = None
         last_model_config = None
         last_judge_result = None
+        last_response_model = None
 
         start_time = time.monotonic()
 
@@ -195,13 +197,17 @@ class CascadeEngine:
             models_attempted.append(routing_key)
 
             try:
-                response = await provider.chat_completions(request, model_config)
+                if rsl_trace:
+                    response = await rsl_trace.complete(provider, request, model_config, routing_key)
+                else:
+                    response = await provider.chat_completions(request, model_config)
             except Exception as e:
                 logger.warning("Cascade step %d failed for %s: %s", idx, routing_key, e)
                 validation_reasons.append(f"provider_error:{str(e)[:50]}")
                 continue
 
             last_response = response
+            last_response_model = routing_key
             last_provider = provider
             last_model_config = model_config
 
@@ -213,6 +219,8 @@ class CascadeEngine:
                 webhook_validator,
             )
             last_judge_result = judge_result
+            if rsl_trace:
+                await rsl_trace.feedback(rsl_trace.last_generation_attempt_id, is_valid, reason, judge_result)
 
             validation_reasons.append(f"{routing_key}:{reason}")
 
@@ -240,7 +248,7 @@ class CascadeEngine:
                 )
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
-        final_model = models_attempted[-1] if models_attempted else original_model
+        final_model = last_response_model or (models_attempted[-1] if models_attempted else original_model)
         cascade_meta = CascadeMetadata(
             enabled=True,
             level=len(models_attempted) - 1,
@@ -283,7 +291,7 @@ class CascadeEngine:
         self,
         original_model: str,
         cascade_meta: CascadeMetadata,
-        total_cost: float,
+        total_cost: float | None,
         total_latency_ms: int,
         request_context: RequestContext | None = None,
         status: str = "success",

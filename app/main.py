@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -12,6 +13,7 @@ from app.core.router import RouterEngine
 from app.core.embedder import SemanticEmbedder
 from app.core.cascade import CascadeEngine
 from app.core.recommender import ModelRecommender
+from app.rsl.store import RSLStore
 from app.core.model_discovery import sync_all_providers_from_remote
 from app.core.rate_limit import FixedWindowRateLimiter
 from app.core.exceptions import (
@@ -118,6 +120,10 @@ async def lifespan(app: FastAPI):
     app.state.router = router
     app.state.cascade = cascade
     app.state.recommender = recommender
+    app.state.rsl_store = (
+        await asyncio.to_thread(RSLStore, os.environ.get("ROUTER_RSL_DB", "rsl.db"))
+        if _env_flag("ROUTER_RSL_ENABLED", False) else None
+    )
     app.state.runtime_mode = runtime_mode
     app.state.enable_admin_api = enable_admin_api
     app.state.enable_standalone_keys = enable_standalone_keys
@@ -225,6 +231,7 @@ async def health_check(request: Request):
                 "keyword_routing": getattr(request.app.state, "keyword_routing_enabled", False),
                 "semantic_routing": getattr(request.app.state, "semantic_routing_enabled", False),
                 "recommendation": bool(getattr(request.app.state, "recommender", None)),
+                "rsl": getattr(request.app.state, "rsl_store", None) is not None,
                 "cascade": getattr(request.app.state, "cascade_enabled", False),
                 "admin_api": getattr(request.app.state, "enable_admin_api", True),
                 "standalone_keys": getattr(request.app.state, "enable_standalone_keys", True),

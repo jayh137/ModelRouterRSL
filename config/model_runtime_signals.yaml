@@ -1,0 +1,4 @@
+# Optional measured operational signals, keyed by real routing key/model ID.
+# success_rate is a fraction in [0, 1]; updated_at identifies measurement time.
+# HTTP success rate is an availability signal, not answer quality.
+models: {}

@@ -1,0 +1,11 @@
+# Safe startup configuration. Configure real providers before sending chat traffic.
+# See providers.example.yaml for the supported structure.
+providers: {}
+server:
+  host: 127.0.0.1
+  port: 8000
+auth:
+  api_key: ${ROUTER_API_KEY}
+semantic_routing:
+  enabled: false
+keyword_rules: []

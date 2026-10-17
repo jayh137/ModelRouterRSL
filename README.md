@@ -1,456 +1,101 @@
-# Model Router
+# ModelRouterRSL
 
-`model_router` is an internal AI routing service designed to sit behind a website or upstream application.
+项目仓库：[jayh137/ModelRouterRSL](https://github.com/jayh137/ModelRouterRSL)（私有，需要具有访问权限的 GitHub 账号）。
 
-Its job is narrow:
+在 [NewYearEve-Godsheep/ModelRouterCourse](https://github.com/NewYearEve-Godsheep/ModelRouterCourse) 基础上实现第一版 RSL（Recursive Self-Learning）模型路由闭环：**反馈采集 → 历史表现更新 → 独立评测 → 显式激活 → 版本回滚**。
 
-- choose the model route for a request
-- apply routing-profile policy
-- do keyword / semantic rerouting
-- do cascade fallback
-- forward the request to the provider
-- normalize the response
+本项目保留上游 OpenAI 兼容接口、多供应商、routing profile、关键词/语义路由、cascade、ensemble 与模型可用性检查。RSL 更新 Router 的历史表现信号，不微调候选大模型。它默认关闭，不会在服务启动时生成质量数据或自动发布策略。
 
-It is not intended to be the source of truth for:
+## 第一版范围
 
-- end-user authentication
-- permission checks
-- billing
-- business audit logs
+| 能力 | 行为 |
+| --- | --- |
+| 反馈采集 | 记录请求决策、候选和实际调用；通过受保护的管理接口提交有来源的显式质量反馈 |
+| 历史表现 | 按 routing profile 隔离，按任务类别与模型聚合，保留先验与样本量信息 |
+| 独立评测 | 使用与训练样本分离的完整候选结果矩阵，对比当前与候选策略 |
+| 版本管理 | 训练产物不可变，评测通过后显式激活，支持回滚和恢复基线 |
 
-Those should live in the website or upstream system.
+HTTP 调用成功、回答长度或缺失反馈都不等于质量标签。合成 demo 仅用于验收代码流程，不能说明真实模型质量或成本已经改善。第一版不包含定时自训练、自动探索或自动上线。
 
-## Current Role
+## 快速启动
 
-Recommended production shape:
+需要 **Python 3.11+** 和 Git。先使用有仓库访问权限的 GitHub 账号完成 Git 认证，再克隆；后续命令从仓库根目录执行。
 
-- website authenticates the user
-- website decides `user_id`
-- website sends an internal request to the router
-- router resolves `routing_profile`
-- router applies routing policy and forwards the request
+```powershell
+git clone https://github.com/jayh137/ModelRouterRSL.git
+cd ModelRouterRSL
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
 
-The router still supports a standalone compatibility mode for local testing, but that is no longer the primary deployment model.
-
-## Core Capabilities
-
-- OpenAI-compatible `POST /v1/chat/completions`
-- OpenAI-compatible `GET /v1/models`
-- multi-provider routing for OpenAI / Anthropic / DeepSeek / GLM
-- provider key rotation and failover
-- profile-driven routing policy
-- profile-scoped keyword routing
-- semantic routing
-- profile-scoped cascade fallback
-- ensemble routing
-- provider health tracking
-- route preview / inspect
-- technical telemetry with `request_id`
-
-## Deployment Docs
-
-For rollout and staging instructions, see:
-
-- [Production rollout](docs/deployment/PRODUCTION_ROLLOUT.md)
-- [Deployment example](docs/deployment/DEPLOYMENT_EXAMPLE.md)
-
-## Runtime Modes
-
-### Internal Mode
-
-Use this in production behind the website.
-
-Recommended environment:
-
-```bash
-export ROUTER_RUNTIME_MODE=internal
-export ROUTER_INTERNAL_API_KEY=replace-with-strong-secret
-export ROUTER_ENABLE_STANDALONE_KEYS=false
-export ROUTER_ENABLE_ADMIN_API=false
-export ROUTER_ENABLE_USAGE_API=false
-export ROUTER_DB=router.db
+# 两个独立的本机密钥，当前终端有效。跨终端使用时写入未跟踪的 .env。
+$env:ROUTER_INTERNAL_API_KEY = (& .\.venv\Scripts\python -c "import secrets; print(secrets.token_urlsafe(32))")
+$env:ADMIN_API_KEY = (& .\.venv\Scripts\python -c "import secrets; print(secrets.token_urlsafe(32))")
+.\.venv\Scripts\python -m app.main
 ```
 
-### Standalone Compatibility Mode
+Linux/macOS 使用 `python3 -m venv .venv` 和 `.venv/bin/python`，将 `Copy-Item` 换为 `cp`，通过 `export` 设置相同环境变量。服务默认只监听 `127.0.0.1:8000`。
 
-Use this only for local/dev testing when you want the router to accept direct API keys.
+- 健康检查：`GET http://127.0.0.1:8000/health`
+- 接口文档：`http://127.0.0.1:8000/docs`
+- 默认 `config/providers.yaml` 为 `providers: {}`。服务可启动，但未配置真实模型时无法处理模型请求。
+- 配置结构见 [config/providers.example.yaml](config/providers.example.yaml)。替换真实供应商地址与模型 ID，密钥使用环境变量，不要提交密钥。
+- 初次启动会将 providers 配置写入 `router.db`。之后使用管理 API 修改配置；已有数据库不会被 YAML 文件自动覆盖。
 
-Example:
+内部应用调用 `POST /v1/chat/completions` 时传入 `Authorization: Bearer <ROUTER_INTERNAL_API_KEY>`、`X-User-Id`，并可附带 `X-Routing-Profile-Id`、`X-Request-Id` 与 `X-Allowed-Models`。管理端使用独立的 `Authorization: Bearer <ADMIN_API_KEY>`；仅在本机或受保护的内部服务中开放。
 
-```bash
-export ROUTER_RUNTIME_MODE=standalone
-export ROUTER_ENABLE_STANDALONE_KEYS=true
-export ROUTER_ENABLE_ADMIN_API=true
-export ROUTER_ENABLE_USAGE_API=true
-export ADMIN_API_KEY=dev-admin-secret
-```
+## 启用 RSL
 
-## Website To Router Contract
-
-In internal mode, the website should call the router with:
-
-- `Authorization: Bearer <ROUTER_INTERNAL_API_KEY>`
-- `X-User-Id: <website user id>`
-- `X-Routing-Profile-Id: <profile id>` when already known
-- `X-Request-Id: <request id>`
-- `X-Allowed-Models: <optional csv list>` when the website wants an extra hard restriction
-
-## Routing Profiles
-
-Routing behavior is driven by `routing_profile`.
-
-The current `routing_profile.config_json` supports:
-
-- `default_model`
-- `preferred_providers`
-- `allowed_models`
-- `deny_models`
-- `keyword_routing_enabled`
-- `semantic_routing_enabled`
-- `cascade_enabled`
-- `cascade_override_chain`
-- `cost_bias`
-- `latency_bias`
-- `quality_bias`
-
-Example:
+1. 配置真实 provider/model 与 routing profile，并先验证原有路由能正常处理请求。
+2. 设置 `ROUTER_RSL_ENABLED=true`，重启服务。独立 SQLite 数据库由 `ROUTER_RSL_DB` 指定，默认 `rsl.db`。
+3. 在该 routing profile 的 `config_json` 中设置以下字段，先进入采集模式：
 
 ```json
 {
-  "default_model": "gpt-5.4",
-  "preferred_providers": ["deepseek", "openai"],
-  "allowed_models": ["gpt-5.4", "deepseek-v4-pro", "shared-model"],
-  "deny_models": ["claude-sonnet-5"],
-  "keyword_routing_enabled": true,
-  "semantic_routing_enabled": true,
-  "cascade_enabled": true,
-  "cascade_override_chain": ["deepseek-v4-pro", "gpt-5.5"],
-  "cost_bias": 1.0,
-  "latency_bias": 0.5,
-  "quality_bias": 0.2
+  "recommendation_enabled": true,
+  "rsl_enabled": true,
+  "rsl_mode": "collect"
 }
 ```
 
-## Cascade Local Judge
+4. 采集请求并提交可信质量反馈，训练候选版本，用独立评测集评估。
+5. 评测通过后显式激活版本，将该 profile 的 `rsl_mode` 改为 `active` 才应用学习结果。需要停止使用时切回 `collect` 或禁用该 profile 的 RSL。
+6. 观察实际表现，必要时调用回滚接口。禁用 RSL 不会删除既有数据。
 
-`cascade` can now do more than hard checks like minimum length or refusal detection.
+RSL 的 `active` 模式仍受原有 `allowed_models`、`deny_models`、能力要求和模型不可用检查限制。全局开关、profile 开关、学习版本与推荐模式必须配合设置，具体流程与输入格式见 [docs/RSL.md](docs/RSL.md)。
 
-You can optionally attach a local judge model to a cascade rule. The router will then:
+## 本地验收
 
-1. run the normal hard validator
-2. if that passes, call the configured judge model
-3. accept the answer only if the judge says it is good enough
-4. otherwise continue to the next model in the cascade chain
-
-Useful cascade-rule fields:
-
-- `local_judge_model`
-- `local_judge_threshold`
-- `local_judge_system_prompt`
-
-The response `cascade` metadata may also include:
-
-- `judge_model`
-- `judge_score`
-- `judge_reason`
-
-Example admin payload:
-
-```json
-{
-  "routing_profile_id": 1,
-  "name": "careful-fallback",
-  "source_routing_key": "deepseek-v4-pro",
-  "escalation_chain": ["deepseek-v4-pro", "gpt-5.5"],
-  "min_content_length": 20,
-  "local_judge_model": "claude-sonnet-5",
-  "local_judge_threshold": 0.75,
-  "local_judge_system_prompt": "You are a strict production answer judge for cascade routing. Mark valid=true only when the candidate answer fully addresses the user's request, is specific, not evasive, and matches the requested output format. If the answer is partial, vague, padded, or misses important constraints, return valid=false. Return raw JSON only.",
-  "max_escalations": 1,
-  "priority": 10,
-  "note": "use a local judge before escalating to gpt-5.5"
-}
-```
-
-Recommended starting policy:
-
-- use `local_judge_model` = `claude-sonnet-5` or your most reliable reasoning model
-- use `local_judge_threshold` = `0.75`
-- keep `min_content_length` as a cheap first-pass filter, not your main quality gate
-- let the judge decide whether a long but weak answer should still escalate
-
-## Request Flow
-
-Internal request flow:
-
-1. website authenticates the user
-2. website sends internal request headers
-3. router resolves `RequestContext`
-4. router resolves `routing_profile`
-5. router loads profile policy and effective routing settings
-6. router resolves the initial model target
-7. router optionally applies keyword / semantic rerouting
-8. router optionally applies cascade fallback
-9. router forwards the request upstream
-10. router returns normalized output
-11. router records technical telemetry
-
-## API Surface
-
-### Public Runtime Endpoints
-
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-
-### Admin Endpoints
-
-Admin endpoints are mounted under `/admin` when `ROUTER_ENABLE_ADMIN_API=true`.
-
-Key areas:
-
-- providers
-- provider keys
-- model routes
-- routing profiles
-- keyword rules
-- cascade rules
-- route preview
-- status
-- usage telemetry APIs
-
-Note:
-
-- standalone key endpoints are disabled when `ROUTER_ENABLE_STANDALONE_KEYS=false`
-- usage telemetry endpoints are disabled when `ROUTER_ENABLE_USAGE_API=false`
-
-## Quick Start
-
-### 1. Install Dependencies
+激活虚拟环境后执行，或将 `python` 替换为上述虚拟环境解释器路径：
 
 ```bash
-pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python -m app.rsl.worker demo
+python -m app.rsl.worker --help
 ```
 
-### 2. Configure Provider Access
+测试与 demo 不需要供应商账号，不调用真实模型。demo 使用临时数据库与纯合成数据，不写入生产 `rsl.db`。GitHub Actions 在 Python 3.11、3.12、3.13 上运行相同离线验收。
 
-This project seeds provider and model configuration from `config/providers.yaml`.
+## 配置与数据
 
-For a gateway-style deployment, the website can stay fixed while keys remain split by model family. A common setup is:
+| 文件/变量 | 用途 |
+| --- | --- |
+| `config/providers.yaml` | 服务监听地址、provider/model 配置；初始为空 |
+| `config/task_profiles.yaml` | 任务分类关键词与目标权重；初始全部归入 `general` |
+| `config/model_traits.yaml` | 可解释的模型能力先验；不作为真实反馈 |
+| `config/model_runtime_signals.yaml` | 可选的可用性统计；不作为回答质量 |
+| `config/model_performance_history.yaml` | 可选基线历史数据；初始为空 |
+| `ROUTER_DB` | 上游路由配置及技术日志数据库，默认 `router.db` |
+| `ROUTER_RSL_DB` | RSL 决策、反馈、版本、评测及激活状态，默认 `rsl.db` |
+| `ROUTER_RSL_ENABLED` | 全局 RSL 开关，默认关闭 |
+| `ROUTER_ENABLE_ADMIN_API` / `ADMIN_API_KEY` | 管理 API 开关与独立管理密钥 |
 
-```bash
-export GATEWAY_BASE_URL=https://your-gateway.example/v1
-export OPENAI_KEY_1=sk-your-openai-family-key
-export ANTHROPIC_KEY_1=sk-your-claude-family-key
-export DEEPSEEK_KEY_1=sk-your-deepseek-family-key
-export GLM_KEY_1=sk-your-glm-family-key
-```
+基础安装不包含 `sentence-transformers`；仅在确实需要语义路由时单独安装并配置嵌入模型。RSL 不依赖该大包。
 
-If needed, you can still override individual base URLs:
+不要将 `.env`、数据库、真实请求原文或内部评测数据加入仓库。可将本机评测文件放在已忽略的 `local-data/`。RSL 默认保存路由特征与记录引用；上游技术日志与可选评估器的原有数据行为需在部署时一并检查。
 
-```bash
-export OPENAI_BASE_URL=https://your-gateway.example/v1
-export ANTHROPIC_BASE_URL=https://your-gateway.example/v1
-export DEEPSEEK_BASE_URL=https://your-gateway.example/v1
-export GLM_BASE_URL=https://your-gateway.example/v1
-```
+## 上游与许可
 
-### 3. Start The Service
+上游来源：[NewYearEve-Godsheep/ModelRouterCourse](https://github.com/NewYearEve-Godsheep/ModelRouterCourse)，基于提交 [`e9fe3ef2763a3b241255315c9b6ccd3138d5dbf4`](https://github.com/NewYearEve-Godsheep/ModelRouterCourse/commit/e9fe3ef2763a3b241255315c9b6ccd3138d5dbf4)。本派生实现保留并扩展上游代码，RSL 相关新增代码位于 `app/rsl/`、`app/api/admin/rsl.py` 及相关接入点。
 
-```bash
-python -m app.main
-```
-
-Or:
-
-```bash
-./start.sh
-```
-
-### 4. Check Health
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-## Configuration
-
-Important runtime variables:
-
-- `ROUTER_RUNTIME_MODE`
-- `ROUTER_INTERNAL_API_KEY`
-- `ROUTER_ENABLE_STANDALONE_KEYS`
-- `ROUTER_ENABLE_ADMIN_API`
-- `ROUTER_ENABLE_USAGE_API`
-- `ROUTER_DB`
-- `AUTO_SYNC_PROVIDER_MODELS`
-- `AUTO_SYNC_PROVIDER_MODELS_TIMEOUT`
-- `ADMIN_API_KEY`
-- `ROUTER_MODEL_COOLDOWN_S` (default `60`; temporary model-level quarantine after an explicit unavailable-channel error)
-- `ROUTER_MODEL_UNAVAILABLE_RETRIES` (default `3`; failure-only re-selection for `auto`, not quality cascade)
-
-When an automatically recommended model returns an explicit "model not found",
-"model unavailable", or "no available channel" error, the router temporarily
-quarantines that real model and all of its routing-key aliases. The same
-request can then select another ranked candidate, without judging the answer
-or escalating a successful response. The quarantine is process-local and
-expires automatically.
-
-Use `GET /admin/status` to inspect active model quarantines, or
-`POST /admin/route/preview` to see a quarantined model in the recommendation
-`excluded` list.
-
-## CLI Commands
-
-Available management commands:
-
-```bash
-python -m app.manage init
-python -m app.manage reset
-python -m app.manage sync-models
-python -m app.manage check-health
-python -m app.manage preview-route gpt-5.4 "please translate this sentence"
-python -m app.manage gen-key
-python -m app.manage list-keys
-python -m app.manage list-models
-python -m app.manage stats
-```
-
-Other utilities:
-
-```bash
-python -m app.discover
-python -m app.benchmark --admin-key "$ADMIN_API_KEY"
-```
-
-## Admin Setup Flow
-
-In staging or dev, a common setup flow is:
-
-1. create providers
-2. add provider keys
-3. sync models
-4. create routing profiles
-5. bind `user_id -> routing_profile`
-6. add profile-scoped keyword or cascade rules
-7. preview routes before real traffic
-
-See [Deployment example](docs/deployment/DEPLOYMENT_EXAMPLE.md) for concrete commands.
-
-## Architecture
-
-```text
-Website / Upstream App
-  -> internal auth
-  -> X-User-Id / X-Request-Id / X-Routing-Profile-Id
-  -> model_router
-     -> request context
-     -> routing profile
-     -> route policy
-     -> keyword / semantic / cascade
-     -> provider adapter
-     -> upstream provider
-```
-
-## Project Structure
-
-```text
-model_router/
-├── app/
-│   ├── api/
-│   │   ├── admin/
-│   │   │   ├── providers.py
-│   │   │   ├── models.py
-│   │   │   ├── keys.py
-│   │   │   ├── usage.py
-│   │   │   ├── status.py
-│   │   │   ├── keyword.py
-│   │   │   ├── cascade.py
-│   │   │   ├── inspect.py
-│   │   │   └── routing_profiles.py
-│   │   ├── chat.py
-│   │   └── models.py
-│   ├── core/
-│   │   ├── auth.py
-│   │   ├── request_context.py
-│   │   ├── routing_policy.py
-│   │   ├── routing_settings.py
-│   │   ├── router.py
-│   │   ├── cascade.py
-│   │   ├── db.py
-│   │   └── ...
-│   ├── providers/
-│   ├── schemas/
-│   ├── main.py
-│   ├── manage.py
-│   ├── discover.py
-│   └── benchmark.py
-├── config/
-│   └── providers.yaml
-├── docs/
-│   ├── deployment/
-│   └── testing/
-├── artifacts/
-│   ├── reports/
-│   └── usage_logs/
-├── experiments/
-│   └── chatbot-arena/
-├── setup.py
-├── start.sh
-└── tests/
-```
-
-## Troubleshooting
-
-### No Models Loaded
-
-- check provider keys
-- run `python -m app.manage sync-models`
-- check `config/providers.yaml`
-
-### Internal Requests Return 401
-
-- verify `ROUTER_INTERNAL_API_KEY`
-- verify website sends `Authorization: Bearer <token>`
-
-### Standalone Keys Do Not Work
-
-- verify `ROUTER_ENABLE_STANDALONE_KEYS=true`
-- verify you are not running in locked-down internal mode
-
-### Admin Endpoints Return 404
-
-- verify `ROUTER_ENABLE_ADMIN_API=true`
-
-### Usage Endpoints Return 404
-
-- verify `ROUTER_ENABLE_USAGE_API=true`
-
-### Provider Failures
-
-- run `python -m app.manage check-health`
-- inspect `/admin/status` in staging/dev
-- verify upstream credentials and base URLs
-
-## Testing
-
-Focused local verification:
-
-```bash
-python -m unittest tests.test_router_flows tests.test_route_preview tests.test_provider_health tests.test_remote_provider_health -v
-```
-
-Real-provider integration tests exist in:
-
-- [tests/test_integration_real.py](./tests/test_integration_real.py:1)
-
-They require explicit environment setup and are not intended for every local run.
-
-## Status
-
-This repository is now aligned around an internal-service-first router:
-
-- website-driven identity
-- routing-profile-driven behavior
-- provider routing and fallback
-- optional standalone compatibility for local testing
+导入的上游快照未提供 `LICENSE` 文件。本仓库未自行给整个项目附加开源许可证，也不据此声明对上游代码拥有再许可权；使用、分发或商业部署请确认上游授权条件。

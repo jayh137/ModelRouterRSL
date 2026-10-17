@@ -37,6 +37,7 @@ class LocalJudge:
         self.judge_model = judge_model
         self.threshold = max(0.0, min(1.0, float(threshold)))
         self.system_prompt = system_prompt or DEFAULT_JUDGE_SYSTEM_PROMPT
+        self.rsl_trace = None
 
     def _build_messages(self, request: ChatRequest, response: ChatResponse) -> list[ChatMessage]:
         original_messages = [message.model_dump() for message in request.messages]
@@ -136,7 +137,12 @@ class LocalJudge:
                     "max_tokens": 300,
                 }
             )
-            judge_response = await provider.chat_completions(judge_request, model_config)
+            if self.rsl_trace:
+                judge_response = await self.rsl_trace.complete(
+                    provider, judge_request, model_config, self.judge_model, kind="judge",
+                )
+            else:
+                judge_response = await provider.chat_completions(judge_request, model_config)
             return self._parse_result(judge_response)
         except Exception as exc:
             logger.warning("Local judge validation failed for %s: %s", self.judge_model, exc)

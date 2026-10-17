@@ -1,0 +1,5 @@
+# Optional operator priors, keyed by real routing key/model ID.
+# Capabilities (e.g. reasoning, writing, instruction_following), latency and
+# cost_efficiency use 0..100. They are priors, not measured quality labels.
+# Set only values you can justify. Missing capabilities use recommender defaults.
+models: {}
