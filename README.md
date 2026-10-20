@@ -1,6 +1,6 @@
 # ModelRouterRSL
 
-项目仓库：[jayh137/ModelRouterRSL](https://github.com/jayh137/ModelRouterRSL)（私有，需要具有访问权限的 GitHub 账号）。
+项目仓库：[jayh137/ModelRouterRSL](https://github.com/jayh137/ModelRouterRSL)
 
 在 [NewYearEve-Godsheep/ModelRouterCourse](https://github.com/NewYearEve-Godsheep/ModelRouterCourse) 基础上实现第一版 RSL（Recursive Self-Learning）模型路由闭环：**反馈采集 → 历史表现更新 → 独立评测 → 显式激活 → 版本回滚**。
 
